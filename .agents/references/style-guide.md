@@ -325,9 +325,9 @@ All components are imported from `~/components`. Imports must appear after the f
 | `DirectoryListing`                    | Auto-generated child page listing for nav/overview pages                            |
 | `ListTutorials`                       | Auto-generated tutorial table for the current product                               |
 | `ResourcesBySelector`                 | Filterable list of pages by `pcx_content_type`, tags, or products                   |
-| `ExternalResources`                   | Demo apps from central YAML collection, filtered by tags/products                   |
 | `PublicStats`                         | Inline live statistic (data centers, bandwidth, etc.)                               |
 | `YouTube`                             | Embed a YouTube video by ID                                                         |
+| `YouTubeVideos`                       | Grid of YouTube videos for a product from `src/content/videos/`                     |
 | `Stream`                              | Embed a Cloudflare Stream video by ID or collection file                            |
 | `APIRequest`                          | Generate a `curl` command from the Cloudflare OpenAPI schema                        |
 | `CURL`                                | Generate a `curl` command for arbitrary URLs                                        |

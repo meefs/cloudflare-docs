@@ -741,20 +741,6 @@ To add or update stats, edit `src/components/PublicStats.astro`.
 
 ---
 
-## ExternalResources
-
-Pulls demo apps from the central `src/content/apps/index.yaml` collection, filtered by tags and products.
-
-```mdx
-import { ExternalResources } from "~/components";
-
-<ExternalResources type="apps" tags={["AI"]} products={["Workers"]} />
-```
-
-Props: `type` (required, `"apps"`), `tags` (string array, filter by tag), `products` (string array, filter by product), `cloudflareOnly` (boolean, default `true`).
-
----
-
 ## ResourcesBySelector
 
 Displays a filterable list of docs pages pulled by `pcx_content_type`, `tags`, and/or `products` frontmatter. Used on example and tutorial index pages.
