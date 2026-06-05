@@ -4,9 +4,10 @@
  * Receives GitHub webhooks (issues, pull_request events), verifies the
  * signature, and dispatches to the appropriate subagents:
  *
- * - spam-and-off-topic-filter: runs on opened/reopened/synchronize/ready_for_review
+ * - dependabot-review: runs on PRs from dependabot[bot] (skips spam filter)
+ * - spam-and-off-topic-filter: runs on opened/reopened/synchronize/ready_for_review (non-Dependabot)
  * - code-review-orchestrator: runs on PR opened/reopened/synchronize/ready_for_review
- *   (only if spam filter did not close the item)
+ *   (only if spam filter did not close the item, non-Dependabot)
  *
  * POST /workflows/orchestrate
  */
@@ -14,6 +15,7 @@ import type { FlueContext, WorkflowRouteHandler } from "@flue/runtime";
 import {
 	addReactionToComment,
 	getInstallationToken,
+	getPullRequest,
 	isCodeOwner,
 	verifyGitHubSignature,
 } from "../lib/github";
@@ -75,13 +77,32 @@ export async function run({ payload, env, req }: FlueContext) {
 	// });
 
 	// ── 2. Route to the right pipeline ─────────────────────────────────────
+
+	// Detect Dependabot PRs — route to the Dependabot review workflow instead
+	// of the normal spam-filter → code-review pipeline.
+	const prAuthorLogin = (
+		(body.pull_request as Record<string, unknown> | undefined)?.user as
+			| Record<string, unknown>
+			| undefined
+	)?.login as string | undefined;
+	const isDependabotPr =
+		eventType === "pull_request" && prAuthorLogin === "dependabot[bot]";
+
 	const isSpamFilterEvent =
+		!isDependabotPr &&
 		["issues", "pull_request"].includes(eventType) &&
 		(["opened", "reopened", "synchronize"].includes(webhookAction as string) ||
 			(eventType === "pull_request" && webhookAction === "ready_for_review"));
 
 	const isCodeReviewEvent =
+		!isDependabotPr &&
 		eventType === "pull_request" &&
+		["opened", "reopened", "synchronize", "ready_for_review"].includes(
+			webhookAction as string,
+		);
+
+	const isDependabotReviewEvent =
+		isDependabotPr &&
 		["opened", "reopened", "synchronize", "ready_for_review"].includes(
 			webhookAction as string,
 		);
@@ -103,6 +124,7 @@ export async function run({ payload, env, req }: FlueContext) {
 		!req ||
 		(!isSpamFilterEvent &&
 			!isCodeReviewEvent &&
+			!isDependabotReviewEvent &&
 			!isFullReviewCommand &&
 			!isReviewCommand)
 	) {
@@ -111,6 +133,33 @@ export async function run({ payload, env, req }: FlueContext) {
 
 	if (!number) {
 		return { acted: false, summary: "No issue or PR number found." };
+	}
+
+	// ── 3a. Handle Dependabot PR events ─────────────────────────────────────
+	if (isDependabotReviewEvent) {
+		const baseUrl = new URL(req.url);
+		const dependabotUrl = new URL(baseUrl);
+		dependabotUrl.pathname = `/workflows/dependabot-review`;
+		dependabotUrl.searchParams.set("wait", "result");
+		const dependabotResponse = await fetch(dependabotUrl, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ eventType: "pull_request", number }),
+		});
+		if (!dependabotResponse.ok) {
+			console.log({
+				message: `Dependabot review dispatch failed: ${webhookLabel}`,
+				event: "github_webhook_orchestrator",
+				delivery,
+				number,
+				action: "dependabot_review_dispatch_failed",
+				status: dependabotResponse.status,
+			});
+		}
+		return {
+			acted: true,
+			summary: `Dependabot review dispatched for PR #${number}.`,
+		};
 	}
 
 	// ── 3. Handle /full-review command ──────────────────────────────────────
@@ -141,23 +190,39 @@ export async function run({ payload, env, req }: FlueContext) {
 		// Acknowledge immediately with 👀 so the user knows we saw it
 		const eyesReactionId = await addReactionToComment(token, commentId, "eyes");
 
-		// Dispatch full review, passing comment info so orchestrator can swap reaction
+		// Check if the PR is from Dependabot — if so route to dependabot-review
+		const prForSlash = await getPullRequest(token, number).catch(() => null);
 		const baseUrl = new URL(req.url);
 		const reviewUrl = new URL(baseUrl);
-		reviewUrl.pathname = `/workflows/code-review-orchestrator`;
-		reviewUrl.searchParams.set("wait", "result");
-		const _reviewResponse = await fetch(reviewUrl, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				eventType: "pull_request",
-				number,
-				forceFullReview: true,
-				bypassReviewLimit: true,
-				triggerCommentId: commentId,
-				triggerEyesReactionId: eyesReactionId,
-			}),
-		});
+		if (prForSlash?.user?.login === "dependabot[bot]") {
+			reviewUrl.pathname = `/workflows/dependabot-review`;
+			reviewUrl.searchParams.set("wait", "result");
+			const _reviewResponse = await fetch(reviewUrl, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					eventType: "pull_request",
+					number,
+					triggerCommentId: commentId,
+					triggerEyesReactionId: eyesReactionId,
+				}),
+			});
+		} else {
+			reviewUrl.pathname = `/workflows/code-review-orchestrator`;
+			reviewUrl.searchParams.set("wait", "result");
+			const _reviewResponse = await fetch(reviewUrl, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					eventType: "pull_request",
+					number,
+					forceFullReview: true,
+					bypassReviewLimit: true,
+					triggerCommentId: commentId,
+					triggerEyesReactionId: eyesReactionId,
+				}),
+			});
+		}
 
 		// console.log({
 		// 	message: `Full review dispatched by ${senderLogin}: PR #${number}`,
@@ -202,22 +267,38 @@ export async function run({ payload, env, req }: FlueContext) {
 		// Acknowledge immediately with 👀
 		const eyesReactionId = await addReactionToComment(token, commentId, "eyes");
 
-		// Dispatch a normal review (incremental if prior review exists, full if not)
+		// Check if the PR is from Dependabot — if so route to dependabot-review
+		const prForReview = await getPullRequest(token, number).catch(() => null);
 		const baseUrl = new URL(req.url);
 		const reviewUrl = new URL(baseUrl);
-		reviewUrl.pathname = `/workflows/code-review-orchestrator`;
-		reviewUrl.searchParams.set("wait", "result");
-		const _reviewResponse = await fetch(reviewUrl, {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({
-				eventType: "pull_request",
-				number,
-				bypassReviewLimit: true,
-				triggerCommentId: commentId,
-				triggerEyesReactionId: eyesReactionId,
-			}),
-		});
+		if (prForReview?.user?.login === "dependabot[bot]") {
+			reviewUrl.pathname = `/workflows/dependabot-review`;
+			reviewUrl.searchParams.set("wait", "result");
+			const _reviewResponse = await fetch(reviewUrl, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					eventType: "pull_request",
+					number,
+					triggerCommentId: commentId,
+					triggerEyesReactionId: eyesReactionId,
+				}),
+			});
+		} else {
+			reviewUrl.pathname = `/workflows/code-review-orchestrator`;
+			reviewUrl.searchParams.set("wait", "result");
+			const _reviewResponse = await fetch(reviewUrl, {
+				method: "POST",
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify({
+					eventType: "pull_request",
+					number,
+					bypassReviewLimit: true,
+					triggerCommentId: commentId,
+					triggerEyesReactionId: eyesReactionId,
+				}),
+			});
+		}
 
 		// console.log({
 		// 	message: `Review dispatched by ${senderLogin}: PR #${number}`,

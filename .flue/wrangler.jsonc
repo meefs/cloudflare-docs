@@ -24,6 +24,10 @@
 				"StyleGuideReviewWorkflow",
 			],
 		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": ["DependabotReviewWorkflow"],
+		},
 	],
 	"observability": {
 		"enabled": true,
