@@ -18,7 +18,6 @@ import {
 	getDefaultWorkspace,
 	getShellSandbox,
 } from "../connectors/cloudflare-shell";
-import * as v from "valibot";
 import {
 	addReactionToComment,
 	comparePullRequestHeads,
@@ -32,71 +31,36 @@ import {
 	type GitHubIssueComment,
 } from "../lib/github";
 import { getInternalHeaders } from "../lib/internal-auth";
-import type { StyleGuideFinding, StyleGuideResult } from "./style-guide-review";
+import {
+	dispatchStyleGuideReview,
+	mergeStyleGuideResults,
+	selectStyleGuideFiles,
+	STYLE_GUIDE_CONCURRENCY,
+	withConcurrency,
+} from "../lib/style-guide-fanout";
+import type {
+	StyleGuideFinding,
+	StyleGuideResult,
+} from "../lib/style-guide-results";
+import { writeDiffToR2 } from "../lib/code-review-diff";
+import {
+	BOT_COMMENT_MARKER,
+	type DiffMode,
+	extractReviewedHeadSha,
+	getAutoReviewCount,
+	incrementAutoReviewCount,
+	partitionComments,
+} from "../lib/code-review-state";
+import {
+	ReconcileResultSchema,
+	type ReconcileResult,
+	renderComment,
+	renderFailureComment,
+	renderPendingComment,
+	renderReviewLimitComment,
+} from "../lib/code-review-render";
 
 export const route: WorkflowRouteHandler = async (_c, next) => next();
-
-// Only review docs/partials/changelog MDX, capped before specialist fan-out.
-const STYLE_GUIDE_REVIEWABLE_PATH_RE =
-	/^src\/content\/(docs|partials|changelog)\/.+\.mdx$/;
-const STYLE_GUIDE_MAX_FILES = 20;
-const STYLE_GUIDE_CONCURRENCY = 10;
-
-// Marker embedded in every bot review comment — used to find and update it
-const BOT_COMMENT_MARKER = "<!-- cloudflare-docs-flue-code-review -->";
-
-// Regex to extract the previously reviewed head SHA from the bot comment
-const REVIEWED_HEAD_SHA_RE = /<!-- reviewed-head-sha: ([0-9a-f]{40}) -->/;
-const REVIEWED_AT_RE = /<!-- reviewed-at: ([^\n]+) -->/;
-
-function extractReviewedHeadSha(body: string | null): string | null {
-	if (!body) return null;
-	const m = body.match(REVIEWED_HEAD_SHA_RE);
-	return m?.[1] ?? null;
-}
-
-function extractReviewedAt(body: string | null): string | null {
-	if (!body) return null;
-	const m = body.match(REVIEWED_AT_RE);
-	return m?.[1] ?? null;
-}
-
-// Describes whether this run reviewed the full PR diff or only commits
-// since the last bot review. Passed to the reconciler so it can apply the
-// correct resolution logic.
-type DiffMode =
-	| { type: "full" }
-	| { type: "incremental"; fromSha: string; toSha: string };
-
-const ReconcileResultSchema = v.object({
-	active: v.array(
-		v.object({
-			id: v.string(),
-			severity: v.picklist(["warning", "suggestion"]),
-			path: v.string(),
-			line: v.optional(v.number()),
-			rule: v.string(),
-			evidence: v.string(),
-			suggestion: v.string(),
-		}),
-	),
-	ignored_by_reviewer: v.array(
-		v.object({
-			id: v.string(),
-			severity: v.picklist(["warning", "suggestion"]),
-			path: v.string(),
-			line: v.optional(v.number()),
-			rule: v.string(),
-			evidence: v.string(),
-			suggestion: v.string(),
-			reviewer_note: v.string(),
-		}),
-	),
-	resolved: v.array(v.string()),
-	summary: v.string(),
-});
-
-type ReconcileResult = v.InferOutput<typeof ReconcileResultSchema>;
 
 interface CodeReviewOrchestratorPayload {
 	eventType: "pull_request";
@@ -195,7 +159,7 @@ export async function run({ id: runId, init, payload, env, req }: FlueContext) {
 
 	const agent = createAgent(() => ({
 		sandbox: getShellSandbox({ workspace, loader }),
-		model: "cloudflare/@cf/moonshotai/kimi-k2.6",
+		model: "cloudflare/@cf/moonshotai/kimi-k2.7-code",
 	}));
 	const harness = await init(agent);
 
@@ -374,15 +338,16 @@ export async function run({ id: runId, init, payload, env, req }: FlueContext) {
 		const internalHeaders = getInternalHeaders(
 			typedEnv as Record<string, string>,
 		);
-		// console.log({
-		// 	message: `Style-guide review fan-out: PR #${input.number} — ${styleGuideFiles.length} file(s), concurrency ${STYLE_GUIDE_CONCURRENCY}`,
-		// 	event: "code_review_orchestrator",
-		// 	number: input.number,
-		// 	files: styleGuideFiles.length,
-		// 	concurrency: STYLE_GUIDE_CONCURRENCY,
-		// 	runId,
-		// 	action: "style_guide_fanout_start",
-		// });
+		console.log({
+			message: `Style-guide review fan-out: PR #${input.number} — ${styleGuideFiles.length} file(s), concurrency ${STYLE_GUIDE_CONCURRENCY}`,
+			event: "code_review_orchestrator",
+			number: input.number,
+			files: styleGuideFiles.length,
+			concurrency: STYLE_GUIDE_CONCURRENCY,
+			diffDir,
+			runId,
+			action: "style_guide_fanout_start",
+		});
 
 		const styleGuideResults = await withConcurrency(
 			styleGuideFiles.map(
@@ -400,14 +365,15 @@ export async function run({ id: runId, init, payload, env, req }: FlueContext) {
 			STYLE_GUIDE_CONCURRENCY,
 		);
 		styleGuideResult = mergeStyleGuideResults(styleGuideResults);
-		// console.log({
-		// 	message: `Style-guide review returned: PR #${input.number} — ${styleGuideResult.findings.length} finding(s)`,
-		// 	event: "code_review_orchestrator",
-		// 	number: input.number,
-		// 	findings: styleGuideResult.findings.length,
-		// 	runId,
-		// 	action: "style_guide_complete",
-		// });
+		console.log({
+			message: `Style-guide review returned: PR #${input.number} — ${styleGuideResult.findings.length} finding(s) across ${styleGuideResult.reviewedFiles.length} file(s)`,
+			event: "code_review_orchestrator",
+			number: input.number,
+			findings: styleGuideResult.findings.length,
+			reviewedFiles: styleGuideResult.reviewedFiles.length,
+			runId,
+			action: "style_guide_complete",
+		});
 
 		// If the agent returned a known failure summary (e.g. model timed out
 		// and produced no output), surface a failure comment rather than
@@ -676,202 +642,6 @@ function parsePayload(payload: unknown): CodeReviewOrchestratorPayload {
 	};
 }
 
-function partitionComments(comments: GitHubIssueComment[]): {
-	botComment: GitHubIssueComment | null;
-	humanCommentsAfterBot: GitHubIssueComment[];
-} {
-	// Find the latest bot review comment (last one containing the marker)
-	let botComment: GitHubIssueComment | null = null;
-	for (const c of comments) {
-		if (c.body?.includes(BOT_COMMENT_MARKER)) {
-			botComment = c;
-		}
-	}
-
-	// Human comments after the last bot review — exclude automated bots
-	// (GitHub Actions, Dependabot, etc.) since they never address review findings.
-	const botTimestamp =
-		extractReviewedAt(botComment?.body ?? null) ??
-		botComment?.created_at ??
-		null;
-	const humanCommentsAfterBot = comments.filter(
-		(c) =>
-			!c.body?.includes(BOT_COMMENT_MARKER) &&
-			c.user?.type !== "Bot" &&
-			(botTimestamp === null || c.created_at > botTimestamp),
-	);
-
-	return { botComment, humanCommentsAfterBot };
-}
-
-interface DiffManifestEntry {
-	filename: string;
-	status: string;
-	additions: number;
-	deletions: number;
-	changes: number;
-	/** R2 key for the patch file, or null if no patch is available. */
-	patch_key: string | null;
-}
-
-function selectStyleGuideFiles(
-	files: Awaited<ReturnType<typeof getPullRequestFiles>>,
-): Awaited<ReturnType<typeof getPullRequestFiles>> {
-	return files
-		.filter(
-			(file) =>
-				STYLE_GUIDE_REVIEWABLE_PATH_RE.test(file.filename) &&
-				file.additions > 0 &&
-				file.patch,
-		)
-		.sort((a, b) => b.additions - a.additions)
-		.slice(0, STYLE_GUIDE_MAX_FILES);
-}
-
-async function withConcurrency<T>(
-	tasks: Array<() => Promise<T>>,
-	limit: number,
-): Promise<T[]> {
-	const results: T[] = new Array(tasks.length);
-	let index = 0;
-
-	async function worker() {
-		while (index < tasks.length) {
-			const current = index++;
-			results[current] = await tasks[current]();
-		}
-	}
-
-	await Promise.all(
-		Array.from({ length: Math.min(limit, tasks.length) }, () => worker()),
-	);
-	return results;
-}
-
-function mergeStyleGuideResults(results: StyleGuideResult[]): StyleGuideResult {
-	const findingsById = new Map<string, StyleGuideFinding>();
-	const reviewedFiles = new Set<string>();
-
-	for (const result of results) {
-		for (const finding of result.findings) {
-			findingsById.set(finding.id, finding);
-		}
-		for (const file of result.reviewedFiles) {
-			reviewedFiles.add(file);
-		}
-	}
-
-	const findings = [...findingsById.values()];
-	const warnings = findings.filter((f) => f.severity === "warning").length;
-	const suggestions = findings.filter(
-		(f) => f.severity === "suggestion",
-	).length;
-	const summary =
-		findings.length === 0
-			? "No style-guide issues found."
-			: `${warnings} warning(s) and ${suggestions} suggestion(s) found across ${reviewedFiles.size} file(s).`;
-
-	return {
-		findings,
-		summary,
-		reviewedFiles: [...reviewedFiles],
-	};
-}
-
-async function writeDiffToR2(
-	bucket: R2Bucket,
-	diffDir: string,
-	files: Awaited<ReturnType<typeof getPullRequestFiles>>,
-	pr: import("../lib/github").GitHubPullRequest,
-): Promise<void> {
-	const manifest: DiffManifestEntry[] = [];
-
-	await Promise.all(
-		files.map(async (file) => {
-			// Encode the filename into a safe flat key: replace slashes with __
-			const safeName = file.filename.replace(/\//g, "__");
-			const patchKey = file.patch ? `${diffDir}/${safeName}.patch` : null;
-
-			if (file.patch && patchKey) {
-				await bucket.put(patchKey, file.patch);
-			}
-
-			manifest.push({
-				filename: file.filename,
-				status: file.status,
-				additions: file.additions,
-				deletions: file.deletions,
-				changes: file.changes,
-				patch_key: patchKey,
-			});
-		}),
-	);
-
-	await Promise.all([
-		bucket.put(`${diffDir}/manifest.json`, JSON.stringify(manifest, null, 2)),
-		bucket.put(
-			`${diffDir}/pr.json`,
-			JSON.stringify(
-				{
-					number: pr.number,
-					title: pr.title,
-					description: pr.body ?? "",
-					author: pr.user?.login ?? "",
-					base: pr.base.ref,
-					head: pr.head.ref,
-					labels: pr.labels.map((l) => l.name),
-					files: manifest.map((f) => ({
-						filename: f.filename,
-						status: f.status,
-						additions: f.additions,
-						deletions: f.deletions,
-						changes: f.changes,
-					})),
-				},
-				null,
-				2,
-			),
-		),
-	]);
-}
-
-async function dispatchStyleGuideReview(
-	reviewId: string,
-	prNumber: number,
-	diffDir: string,
-	commentsPath: string,
-	req: Request | undefined,
-	internalHeaders: HeadersInit,
-	filename?: string,
-): Promise<StyleGuideResult> {
-	// Derive the base URL from the incoming request so this works on any port
-	// in local dev as well as in production without extra env config.
-	const baseUrl = req ? new URL(req.url).origin : "http://localhost:8787";
-	const url = new URL(`/workflows/style-guide-review`, baseUrl);
-	url.searchParams.set("wait", "result");
-
-	const response = await fetch(url, {
-		method: "POST",
-		headers: internalHeaders,
-		body: JSON.stringify({ number: prNumber, diffDir, commentsPath, filename }),
-	});
-
-	if (!response.ok) {
-		throw new Error(
-			`Style-guide review dispatch failed: ${response.status} ${await response.text()}`,
-		);
-	}
-
-	const result = (await response.json()) as { result?: StyleGuideResult };
-	return (
-		result.result ?? {
-			findings: [],
-			summary: "Style-guide review produced no result.",
-			reviewedFiles: [],
-		}
-	);
-}
-
 async function postOrUpdateComment(
 	token: string,
 	prNumber: number,
@@ -883,260 +653,4 @@ async function postOrUpdateComment(
 	} else {
 		await postComment(token, prNumber, body);
 	}
-}
-
-function renderFailureComment(headSha: string): string {
-	const shortSha = headSha.slice(0, 7);
-	return [
-		BOT_COMMENT_MARKER,
-		`<!-- reviewed-head-sha: ${headSha} -->`,
-		`<!-- updated-at: ${new Date().toISOString()} -->`,
-		"",
-		"## Review",
-		"",
-		`❌ Review failed for commit \`${shortSha}\`. This is usually a transient error — it will retry on the next push.`,
-	].join("\n");
-}
-
-function renderPendingComment(
-	headSha: string,
-	isUpdate: boolean,
-	forceFullReview?: boolean,
-	existingBody?: string,
-): string {
-	const shortSha = headSha.slice(0, 7);
-	const status = forceFullReview
-		? `Full review in progress for entire PR diff (commit \`${shortSha}\`)…`
-		: isUpdate
-			? `Reviewing new changes (commit \`${shortSha}\`)…`
-			: `Review in progress for commit \`${shortSha}\`…`;
-
-	// If there's an existing *completed* review body, preserve it below the pending notice.
-	// Don't preserve a body that was itself a pending placeholder (to avoid duplication).
-	// Strip the old header metadata lines (HTML comments + "## Review" heading).
-	const wasAlreadyPending = existingBody?.includes("<!-- status: pending -->");
-	const preservedBody =
-		existingBody && !wasAlreadyPending
-			? existingBody
-					.split("\n")
-					.filter(
-						(l) =>
-							!l.startsWith("<!-- ") &&
-							l !== "## Review" &&
-							l !== BOT_COMMENT_MARKER,
-					)
-					.join("\n")
-					.replace(/^\n+/, "")
-			: null;
-
-	const lines = [
-		BOT_COMMENT_MARKER,
-		`<!-- reviewed-head-sha: ${headSha} -->`,
-		`<!-- updated-at: ${new Date().toISOString()} -->`,
-		`<!-- status: pending -->`,
-		"",
-		"## Review",
-		"",
-		status,
-	];
-
-	if (preservedBody) {
-		lines.push("", "---", "", preservedBody);
-	}
-
-	return lines.join("\n");
-}
-
-function renderComment(
-	reconciled: ReconcileResult,
-	reviewedHeadSha: string,
-	forceFullReview?: boolean,
-): string {
-	const shortSha = reviewedHeadSha.slice(0, 7);
-	const reviewedAt = new Date().toISOString();
-	// Exclude anything acknowledged by the reviewer from active sections
-	const ignoredPaths = new Set(
-		reconciled.ignored_by_reviewer.map((f) => `${f.path}:${f.line}:${f.rule}`),
-	);
-	const activeFindings = reconciled.active.filter(
-		(f) => !ignoredPaths.has(`${f.path}:${f.line}:${f.rule}`),
-	);
-	const warnings = activeFindings.filter((f) => f.severity === "warning");
-	const suggestions = activeFindings.filter((f) => f.severity === "suggestion");
-	const totalActive = activeFindings.length;
-	const scope = forceFullReview ? "full PR diff" : `commit \`${shortSha}\``;
-
-	// Status line
-	let statusLine: string;
-	if (totalActive === 0 && reconciled.ignored_by_reviewer.length === 0) {
-		statusLine = `✅ No style-guide issues found in ${scope}.`;
-	} else if (warnings.length > 0) {
-		statusLine = `⚠️ ${warnings.length} warning${warnings.length === 1 ? "" : "s"}${suggestions.length > 0 ? ` and ${suggestions.length} suggestion${suggestions.length === 1 ? "" : "s"}` : ""} found in ${scope}.`;
-	} else {
-		statusLine = `💡 ${suggestions.length} suggestion${suggestions.length === 1 ? "" : "s"} found in ${scope}.`;
-	}
-
-	const lines: string[] = [
-		BOT_COMMENT_MARKER,
-		`<!-- reviewed-head-sha: ${reviewedHeadSha} -->`,
-		`<!-- reviewed-at: ${reviewedAt} -->`,
-		`<!-- updated-at: ${new Date().toISOString()} -->`,
-		"",
-		"## Review",
-		"",
-		statusLine,
-	];
-
-	// Style guide findings — warnings and suggestions each in a dropdown
-	if (warnings.length > 0) {
-		lines.push("");
-		lines.push("<details open>");
-		lines.push(`<summary><b>Warnings</b> (${warnings.length})</summary>`);
-		lines.push("<br/>");
-		lines.push("");
-		lines.push("| File | Issue |");
-		lines.push("|---|---|");
-		for (const f of warnings) {
-			lines.push(renderFindingRow(f));
-		}
-		lines.push("");
-		lines.push("</details>");
-	}
-
-	if (suggestions.length > 0) {
-		lines.push("");
-		lines.push("<details open>");
-		lines.push(`<summary><b>Suggestions</b> (${suggestions.length})</summary>`);
-		lines.push("<br/>");
-		lines.push("");
-		lines.push("| File | Issue |");
-		lines.push("|---|---|");
-		for (const f of suggestions) {
-			lines.push(renderFindingRow(f));
-		}
-		lines.push("");
-		lines.push("</details>");
-	}
-
-	if (reconciled.ignored_by_reviewer.length > 0) {
-		lines.push("");
-		lines.push("<details>");
-		lines.push(
-			`<summary>Acknowledged by author (${reconciled.ignored_by_reviewer.length})</summary>`,
-		);
-		lines.push("<br/>");
-		lines.push("");
-		lines.push("| File | Issue | Note |");
-		lines.push("|---|---|---|");
-		for (const f of reconciled.ignored_by_reviewer) {
-			const file = formatFile(f.path, f.line);
-			lines.push(
-				`| ${file} | ${sanitizeTableCell(f.rule)} | ${sanitizeTableCell(f.reviewer_note)} |`,
-			);
-		}
-		lines.push("");
-		lines.push("</details>");
-	}
-
-	// Commands section — always shown at the bottom
-	lines.push("");
-	lines.push("<details>");
-	lines.push("<summary>Commands</summary>");
-	lines.push("<br/>");
-	lines.push("");
-	lines.push(
-		"_Only codeowners can run commands. Post a comment with the command to trigger it._",
-	);
-	lines.push("");
-	lines.push("| Command | Description |");
-	lines.push("|---|---|");
-	lines.push(
-		"| `/review` | Runs a review now. Incremental if a prior review exists, full if not. |",
-	);
-	lines.push(
-		"| `/full-review` | Re-reviews the entire PR diff from scratch, ignoring incremental history. Useful after a rebase, when you want a fresh review, or if the bot gets out of sync and reports issues that no longer exist. |",
-	);
-	lines.push("");
-	lines.push("</details>");
-
-	return lines.join("\n");
-}
-
-function formatFile(path: string, line?: number): string {
-	// Shorten path: drop src/content/docs/ prefix for readability
-	const short = path
-		.replace(/^src\/content\/docs\//, "")
-		.replace(/^src\/content\//, "");
-	return line ? `\`${short}\` line ${line}` : `\`${short}\``;
-}
-
-function sanitizeTableCell(value: string): string {
-	return value
-		.replace(/\|/g, "\\|")
-		.replace(/\*/g, "\\*")
-		.replace(/\r?\n/g, " ");
-}
-
-function renderFindingRow(f: ReconcileResult["active"][number]): string {
-	const file = formatFile(f.path, f.line);
-	const rule = sanitizeTableCell(f.rule);
-	const evidence = sanitizeTableCell(f.evidence);
-	const suggestion = sanitizeTableCell(f.suggestion);
-	return `| ${file} | **${rule}** — ${evidence} Fix: ${suggestion} |`;
-}
-
-function renderReviewLimitComment(existingBody?: string): string {
-	const wasAlreadyPending = existingBody?.includes("<!-- status: pending -->");
-	const preservedBody =
-		existingBody && !wasAlreadyPending
-			? existingBody
-					.split("\n")
-					.filter(
-						(l) =>
-							!l.startsWith("<!-- ") &&
-							l !== "## Review" &&
-							l !== BOT_COMMENT_MARKER,
-					)
-					.join("\n")
-					.replace(/^\n+/, "") || null
-			: null;
-
-	const lines = [
-		BOT_COMMENT_MARKER,
-		`<!-- updated-at: ${new Date().toISOString()} -->`,
-		"",
-		"## Review",
-		"",
-		"⏸️ Automatic reviews for this PR are paused.",
-		"",
-		"This PR has already received 2 automatic reviews. To run another review, a codeowner can comment `/review` or `/full-review`.",
-		"",
-		"> **Tip:** Keep PRs in draft mode until they are ready for review — the bot skips draft PRs automatically.",
-	];
-
-	if (preservedBody) {
-		lines.push("", "---", "", preservedBody);
-	}
-
-	return lines.join("\n");
-}
-
-async function getAutoReviewCount(
-	bucket: R2Bucket,
-	prNumber: number,
-): Promise<number> {
-	const key = `diffs/pr-${prNumber}/auto-review-count.json`;
-	const obj = await bucket.get(key);
-	if (!obj) return 0;
-	const data = (await obj.json()) as { count?: number };
-	return data.count ?? 0;
-}
-
-async function incrementAutoReviewCount(
-	bucket: R2Bucket,
-	prNumber: number,
-	current: number,
-): Promise<void> {
-	const key = `diffs/pr-${prNumber}/auto-review-count.json`;
-	await bucket.put(key, JSON.stringify({ count: current + 1 }));
 }
